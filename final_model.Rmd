@@ -1,0 +1,381 @@
+---
+title: "final_model"
+output: html_notebook
+date: "2023-12-13"
+---
+
+0. Load Necessary Packages
+
+```{r}
+library(rstanarm)
+library(bayesplot)
+library(bayesrules)
+library(tidyverse)
+library(tidybayes)
+library(broom.mixed)
+library(scales)
+library(janitor)
+library(caret)
+library(missMethods)
+library(glmnet)
+```
+
+1. Preparatory 
+
+```{r cars}
+df <- read.csv('final_dataset.csv', stringsAsFactors = FALSE)
+
+# Convert female_va and male_va to numeric
+df <- df %>%
+  
+  # Convert female_va and male_va to numeric
+  mutate(
+    female_va = as.numeric(gsub(",", "", female_va)),
+    male_va = as.numeric(gsub(",", "", male_va))) %>%
+  
+  # Add a new column for percent female population
+  mutate(
+    total_va = male_va + female_va,
+    percent_female = female_va / total_va * 100) %>%
+
+  # Treat new and open seats as the same for simplicity
+  mutate(
+    status = case_when(
+      status %in% c("New seat", "Open") ~ "New/Open",
+      TRUE ~ status))
+
+  # Set levels of status column with "New/Open" as the base. Without this line, doing posterior 
+  # summaries shows New/Open and Incumbent R as predictors, while Incumbent D is set as base 
+  # level. That obviously is not good for seeing how incumbency gives an advantage. 
+  df$status <- relevel(factor(df$status, 
+                            levels = c("New/Open", "Incumbent D", "Incumbent R")), 
+                       ref = "New/Open")
+
+```
+
+2. Some visualizations before modeling
+
+```{r, warning=FALSE, message=FALSE}
+# percent female vs percent margin without accounting for incumbency
+ggplot(df, aes(y = margin_percent , x = percent_female)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE)
+
+# percent female vs percent margin when accounting for incumbency
+ggplot(df, aes(y = margin_percent , x = percent_female, color = status)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE)
+```
+There is a change when incumbency is accounted for. You can see that the incumbent categories are more extreme than open seats, showing incumbency gives a boost.
+
+
+3. Simulating the posterior normal regression model using MCMC
+
+```{r}
+df_main <- stan_glm(margin_percent ~ 
+                      percent_female + 
+                      status + 
+                      pvi_margin + 
+                      median_age,
+  data = df, family = gaussian, 
+  chains = 4, iter = 8000*2, seed = 84735)
+```
+
+4. MCMC Diagnostics
+
+```{r}
+## Visual 
+mcmc_trace(df_main, size = 0.1) 
+  # trace plots shows chains are mixing properly and have similar spread
+
+mcmc_dens_overlay(df_main) 
+  # Density plots are roughly normal shaped which is good because the posterior
+  # is supposed to be normal
+
+## Numerical
+ 
+rhat <- rhat(df_main) 
+print(rhat, row.names = FALSE)
+  # Rhat around 1 is good  
+
+neff_ratio <- neff_ratio(df_main) 
+print(neff_ratio, row.names = FALSE)
+  # Neff ratio > 0.1 is good 
+```
+The MCMC plots show that it is mixing well. The Rhat is below the 1.05 threshold. The only thing that concerns me is the effective sample size. It is greater than 0.1, which is the normal indicator of a good MCMC, but the effective sample size is greater than 1, which doesn't make sense conceptually. 
+
+
+5. Taking a look at the model
+
+```{r}
+# Summarizing the posterior 
+tidy(df_main, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.90)
+
+mcmc_dens(df_main) # density plots of parameters
+
+# Posterior predictive check
+pp_check(df_main, nreps = 50) + 
+  xlab("margin")
+
+# Leave-One-Out Cross-Validation 
+mcmc_elpd <- loo(df_main)
+cat("Main model elpd:\n")
+print(mcmc_elpd$estimates, row.names = FALSE)
+```
+Since the y values simulated from the Bayesian model are similar in feature to the original y data, our model assumptions seem reasonable.
+
+
+6. Predictions Simulating and plotting
+
+```{r}
+# Specify new data
+new_data <- data.frame(percent_female = 50, 
+                       status = "Incumbent D", 
+                       median_age = 45,
+                       pvi_margin = -2)
+
+# Simulate Prediction
+prediction_df <- data.frame(
+  margin = as.vector(
+    posterior_predict(
+      df_main, newdata = new_data, seed = 84735)))
+
+# Calculate the density for the density plot
+density_df <- data.frame(margin = density(prediction_df$margin)$x, 
+                         density = density(prediction_df$margin)$y)
+
+# Define how gradient appears based on margin data
+  # A lot of this code is convoluted but setting 0 as the center of the purple regions 
+  # was sooooooo hard for some reason. There is probably a better way to do this, but 
+  # half my total time on this project was figuring this out. 
+gradient_limits <- range(prediction_df$margin) 
+  purple_width <- 10 # Purple will be length 10 (+/- 5) as that is a 'swing' district.
+
+  # Calculating where the edges and center of purple regions should be based on data range. 
+  left_purple <- (0 - purple_width - gradient_limits[1]) / (gradient_limits[2] - gradient_limits[1])
+  right_purple <- (0 + purple_width - gradient_limits[1]) / (gradient_limits[2] - gradient_limits[1])
+  zero_proportion <- (0 - gradient_limits[1]) / (gradient_limits[2] - gradient_limits[1])
+
+values <- c(0, left_purple, zero_proportion, right_purple, 1)
+
+# Plot
+mean_margin <- mean(prediction_df$margin) 
+ggplot(density_df, aes(x = margin, y = density)) +
+    geom_line() +
+    geom_segment(aes(xend = margin, yend = 0, colour = margin)) +
+    
+    # I also spent waaaaaay too long choosing the perfect color scale but I hope you enjoy
+    # Red for republican, blue for democrat, and purple for 'swing'.
+    scale_color_gradientn(colours = 
+                            c("#FF0000", "#D63382", "#9933CC", "#6677FF", "#0099FF"), 
+                          values = scales::rescale(values), guide = "none") +
+    
+    # Solid Line at 0 and dashed line at mean
+    geom_vline(xintercept = 0, color = "black") +
+    geom_vline(xintercept = mean_margin, linetype = "dashed", color = "black") + 
+    
+    scale_x_continuous(limits = c(-44, 44), breaks = seq(-44, 44, by = 4)) +
+    labs(title = "Election Margin", x = "Margin of Victory", y = "Density") +
+    
+    # Put a little text box to indicate the mean of prediction. This extra code just 
+    # is for spatial placement on the graph so it doesn't end up in a weird location. 
+    annotate("text", x = ifelse(mean_margin > 0, mean_margin + 2, mean_margin - 2), 
+           y = 0.9 * max(density_df$density), 
+           label = paste("Mean:", round(mean_margin, 2)), 
+           vjust = 1, hjust = ifelse(mean_margin > 0, 0, 1), 
+           size = 3.5, color = "black")
+```
+
+Interpretation: A hypothetical district that is demographically 50:50 gender ratio, median age of 45, and has an incumbent Democrat running for reelection, and is only slightly preferential to republicans in presidential years would be expected to have the republican candidate win with a 1.67% margin. 
+
+
+6. Create a function for our visualization.
+
+This has option to add a line for the actual election results, if given. 
+```{r}
+predict_mov <- function(model, status = NULL, 
+                        female = NULL, 
+                        median_age = NULL, 
+                        pvi = NULL, 
+                        actual = NULL,
+                        seed = 84735) {
+    
+    new_data <- data.frame(
+    status = status,
+    percent_female = female,
+    median_age = median_age,
+    pvi_margin = pvi)
+  
+  # Filter out the predictors not given to the function
+  new_data <- new_data %>% 
+                select(where(~ !is.null(.)))
+  
+  prediction_df <- data.frame(
+  margin = as.vector(
+    posterior_predict(
+      model, newdata = new_data, seed = seed)))
+  
+  density_df <- data.frame(
+    margin = density(prediction_df$margin)$x, 
+    density = density(prediction_df$margin)$y)
+  
+  gradient_limits <- range(prediction_df$margin)
+  mean_margin <- mean(prediction_df$margin)
+  
+  purple_width <- 10
+  zero_proportion <- (0 - gradient_limits[1]) / (gradient_limits[2] - gradient_limits[1])
+  left_purple <- zero_proportion - (purple_width / diff(gradient_limits))
+  right_purple <- zero_proportion + (purple_width / diff(gradient_limits))
+  
+  values <- c(0, left_purple, zero_proportion, right_purple, 1)
+  
+  p <- ggplot(density_df, aes(x = margin, y = density)) +
+    geom_line() +
+    geom_segment(aes(xend = margin, yend = 0, colour = margin)) +
+    
+    scale_color_gradientn(
+      colours = c("#FF0000", "#D63382", "#9933CC", "#6677FF", "#0099FF"), 
+      values = scales::rescale(values), guide = "none") +
+    
+    geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+    geom_vline(xintercept = mean_margin, linetype = "longdash", color = "black") +
+    
+    labs(title = "Election Margin", x = "Margin of Victory", y = "Density") +
+    scale_x_continuous(limits = c(-44, 44), breaks = seq(-44, 44, by = 4)) +
+    annotate(
+      "text", x = ifelse(mean_margin > 0, mean_margin + 2, mean_margin - 2), 
+      y = 0.9 * max(density_df$density), 
+      label = paste("Mean:", round(mean_margin, 2)), 
+      vjust = 1, hjust = ifelse(mean_margin > 0, 0, 1), 
+      size = 3.5, color = "black")
+  
+  # If provided with the actual election results, add a line for the actual margin to plot. 
+  if (!is.null(actual)) {
+    p <- p + geom_vline(xintercept = actual, linetype = "longdash", color = "green")
+  }
+  return(p)
+}
+```
+
+7. Try out our function ! 
+
+When a representative dies or resigns in office, a special election is called on an off season. We will check if this model does good at predicting the margin of a 2023 special election.
+```{r, warning=FALSE}
+# Virginia's 4th district has a vacant from a death in office. We can put it the demographic 
+# information and see a projected margin of victory for a house race in this district. 
+predict_mov(df_main,
+               status = "New/Open", 
+               female = 51.567, 
+               median_age = 37.2, 
+               pvi = 16, 
+               actual = 48.9)
+  # This one sucked :(
+
+# Rhode Island's's 1st district had a vacancy from a resignation (meaning open seat)
+predict_mov(df_main,
+               status = "New/Open", 
+               female = 51.39, 
+               median_age = 39.9, 
+               pvi = 12, 
+               actual = 29.7)
+  # This one was okay
+
+# Utah's 2nd district also had a resignation
+predict_mov(df_main,
+               status = "New/Open", 
+               female = 48.87, 
+               median_age = 33.7, 
+               pvi = -11, 
+               actual = -23.5)
+    # This one was pretty good :)
+```
+A couple of notes: special elections are always new/open seats, which is the status that my data contains
+the least of. So this is not going to be a great metric. However, we can see that it works because the 
+margin almost always shows the victor, but underestimates the margin. This is probably explained by the fact that special elections are outliers (not in normal election time, low turnout, etc) in election modeling, so they are not great to test our models on. 
+
+--------------------------------------------------------------------------------
+SECOND MODEL
+--------------------------------------------------------------------------------
+
+1. Train linear model
+
+This model includes all of the interaction terms between these predictors. Using a lasso regression because it does both regularization and parameter shrinkage. Parameter shrinkage is important because several of the interaction terms may be useless. This training model uses k-folds cross-validation. Repeats are just to mitigate overfitting and improve generalization of the model. 
+```{r}
+df <- df %>% na.omit(margin_percent)
+
+predictors <- c("percent_female", 
+                "median_age", 
+                "status", 
+                "pvi_margin", 
+                "percent_female:pvi_margin",
+                "percent_female:status", 
+                "percent_female:median_age",
+                "median_age:status",
+                "median_age:pvi_margin",
+                "status:pvi_margin")
+
+formula <- as.formula(paste("margin_percent ~", paste(predictors, collapse = " + ")))
+
+# Set parameters for training the model
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5, # 5-folds
+                     repeats = 3, # 3 repeats
+                     search = "grid") # use grid search for tuning
+
+# Define the grid for hyperparameter tuning
+grid <- expand.grid(.alpha = c(1), # 1 for lasso regression
+                    .lambda = 10^seq(-1.5, 1.5, length.out = 100))
+
+# Train lasso regression model
+lm_model <- train(formula, data = df, method = "glmnet", 
+                  tuneGrid = grid, trControl = ctrl)
+```
+
+2. Now we will check if this model does good at predicting the margin of a 2023 special election.
+```{r}
+# Virginia's 4th
+VA04 <- data.frame(
+               status = "New/Open", 
+               percent_female = 51.567, 
+               median_age = 37.2, 
+               pvi_margin = 16)
+predict(lm_model, newdata = VA04)
+
+# Rhode Island's's 1st
+RI01 <- data.frame(
+               status = "New/Open", 
+               percent_female = 51.39, 
+               median_age = 39.9, 
+               pvi_margin = 12)
+predict(lm_model, newdata = RI01)
+
+# Utah's 2nd
+UT02 <- data.frame(
+               status = "New/Open", 
+               percent_female = 48.87, 
+               median_age = 33.7, 
+               pvi_margin = -11)
+predict(lm_model, newdata = UT02)
+```
+Results are more or less the same as the MCMC model. Perhaps a slightly more democrat bias based one what I've seen.
+
+We will see how the two models compare for a the same set of hypothetical predictors.
+```{r}
+new_hypothetical <- data.frame(
+               status = "Incumbent D", 
+               percent_female = 50, 
+               median_age = 40.5, 
+               pvi_margin = -1)
+predict(lm_model, newdata = new_hypothetical)
+
+predict_mov(df_main,
+               status = "Incumbent D", 
+               female = 50, 
+               median_age = 40.5, 
+               pvi = -1)
+```
+
+All in all, basically the same as the MCMC model. 
+
+On my honor, I have neither received nor given any unauthorized assistance on this project. Ali Ibrahim.

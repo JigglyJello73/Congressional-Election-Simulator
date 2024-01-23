@@ -1,0 +1,208 @@
+---
+title: "Creating Data Set"
+output: html_notebook
+date: "2023-12-13"
+---
+
+0. Load Necessary Packages
+
+```{r}
+library(tidyverse)
+library(janitor)
+``` 
+
+1. Reformatting Census Data
+
+```{r}
+original_data <- read.csv('CENSUS DATA.csv', stringsAsFactors = FALSE) %>%
+  
+    # Identify and remove Percent columns
+    select(-contains("Percent")) 
+
+    # Transpose and keep rows for median age, total/male/female voting age population
+    data <- as.data.frame(t(original_data[c(19, 94, 95, 96), ])) %>%
+
+    # Setting the first columns as data instead of row names
+    rownames_to_column(var = "NewColumn") %>%
+    select(NewColumn, everything()) %>%
+                    
+    # Renaming columns
+    slice(-1) %>%
+    set_names(nm = c("District", "median_age", "total_va", "male_va", "female_va"))
+```
+
+2. Extract State and District # info from 'Districts' Column
+
+```{r}
+# a) State Names
+state_names <- c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", 
+                 "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", 
+                 "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", 
+                 "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", 
+                 "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", 
+                 "New.Hampshire", "New.Jersey", "New.Mexico", "New.York", "North.Carolina", 
+                 "North.Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", 
+                 "Rhode.Island", "South.Carolina", "South.Dakota", "Tennessee", 
+                 "Texas", "Utah", "Vermont", "Virginia", "Washington", "West.Virginia", 
+                 "Wisconsin", "Wyoming", "District.of.Columbia", "Puerto.Rico")
+
+data$State <- sapply(data$District, function(district) {
+  for (state in state_names) {
+    if (grepl(state, district)) {
+      return(gsub("\\.", " ", state))
+    }
+  }
+  return(NA)
+})
+
+# b) Now Districts
+data <- data %>%
+  mutate(district = case_when(
+    
+    # Create new 'district' column with 'AL' for 'at Large'
+    grepl("at.Large", District) ~ "AL",
+    
+    # Mark undefined districts for removal 
+    grepl("not.defined", District) ~ "REMOVE",
+    TRUE ~ str_extract(District, "\\d+")
+  )) %>%
+  
+  # Remove rows with 'not.defined' districts
+  filter(district != "REMOVE") %>%
+  
+# c) Combine State and District into a new 'district' column and remove redundant columns
+  mutate(district_combined = paste(State, district)) %>%
+  select(-district, -State, -District) %>%
+  rename(district = district_combined)
+```
+
+3. Some more processing of PVI_district
+
+```{r}
+pvi <- read.csv('PVI_District.csv', stringsAsFactors = FALSE)
+
+pvi <- pvi %>%
+  janitor::clean_names() %>%
+  
+  # Reformatting PVI to be positive for democrat, negative for republican, and 0 for even
+  mutate(pvi_margin = case_when(
+    str_detect(pvi, "D\\+") ~ as.numeric(str_extract(pvi, "\\d+")),   
+    str_detect(pvi, "R\\+") ~ as.numeric(str_extract(pvi, "\\d+")) * -1, 
+    pvi == "EVEN" ~ 0,   
+  )) %>%
+  
+# Omit missing values
+  filter(!is.na(location)) %>%
+  
+# Clean up district column
+  rename(district = location) %>%
+  mutate(district = str_replace(district, " at-large", " AL")) %>%
+
+# Reformatting Status of the seat (Open, New Seat, Incumbent D/R) 
+  mutate(
+    status = case_when(
+      str_detect(status, "died|retired|resigned") ~ "Open",
+      str_detect(status, "New seat") ~ "New seat",
+      str_detect(status, "Incumbent") & 
+        str_detect(incumbent_party, "Democrat|DFL") ~ "Incumbent D",
+      str_detect(status, "Incumbent") & 
+        str_detect(incumbent_party, "Republican") ~ "Incumbent R",
+      TRUE ~ status
+    )
+  )
+```
+
+4. Combining pvi and census data
+
+```{r}
+# Merging dataset by district
+census_pvi <- merge(data, pvi[, c('district', 'pvi_margin', 'status')], by = 'district') %>%
+  
+  # Add a leading 0 to single digit districts (Since it goes numerically, omitting this step
+  # would cause the table to show like this: California 1, California 11, California 12
+  mutate(
+    district = ifelse(
+      grepl(" AL$", district), 
+      district, 
+      str_replace(district, " (\\d)$", " 0\\1")))
+```
+
+5. Process dataset for margins of victory
+
+```{r}
+margins <- read.csv('Ballotopedia.csv', header = FALSE)
+
+# Set the second row as column names
+colnames(margins) <- margins[2, ]
+margins <- margins[-c(1, 2), ]
+
+margins <- margins %>%
+  
+# Clean column names 
+  janitor::clean_names() %>%
+  
+  # Reformat winner and runner up to drop candidate name and only keep party information
+  mutate(winner = case_when(
+      grepl("Republican", winner) ~ "R",
+      grepl("Democrat", winner) ~ "D",
+      TRUE ~ winner),
+      
+    runner_up = case_when(
+      grepl("Republican", runner_up) ~ "R",
+      grepl("Democrat", runner_up) ~ "D",
+      runner_up %in% c("-", "--") ~ "-",
+      TRUE ~ "I"),
+    
+    # Creating a column of margin victory that's to be numeric and have positive
+    # for democrat and negative for republican. 
+    margin_percent = ifelse(winner == "R", -1, 1) * 
+      as.numeric(str_replace_all(margin_percent, "%", ""))) %>%
+  
+  # Reformat District information. 
+  mutate(
+    district = case_when(
+      # Deal with at-large 
+      grepl("At-Large", district) ~ 
+        str_replace(district, "(.+)'s At-Large Congressional District", "\\1 AL"),
+      # Reformat district number (ex 1st -> 01)
+      TRUE ~ str_replace(district, "(.+)'s (\\d+)(?:th|st|nd|rd) Congressional District", "\\1 \\2"))) %>%
+ 
+  # Reformat state name (ex New.York's -> New York)     
+  mutate(
+    district = str_replace_all(district, "\\.", " ")) %>%
+  rowwise() 
+
+# Function to format district entry
+format_district <- function(district_entry, state_names) {
+    for (state in state_names) {
+        if (grepl(state, district_entry)) {
+            district_number <- gsub("\\D", "", district_entry)
+
+            if (district_number == "") {
+                # Handle 'At-Large' case
+                return(paste(state, "AL", sep = " "))
+            } else {
+                # Format district number with leading zero if necessary
+                return(sprintf("%s %02d", state, as.numeric(district_number)))
+            }
+        }
+    }
+
+    # This return will only be reached if no state name is found
+    return(district_entry)
+}
+
+# Applying the function to the 'district' column
+margins$district <- sapply(margins$district, format_district, state_names)
+```
+
+6. Mergining into final dataset
+```{r}
+final_dataset <- merge(census_pvi, margins[, c('district', 'margin_percent')], by = 'district', all.x = TRUE)
+head(final_dataset, n = 10)
+```
+
+```{r}
+write_csv(final_dataset, 'final_dataset.csv')
+```
+
